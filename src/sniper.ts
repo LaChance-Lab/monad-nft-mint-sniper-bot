@@ -1,38 +1,37 @@
-﻿import { ethers, Contract, Wallet, TransactionResponse, TransactionReceipt, Interface } from "ethers";
+﻿import { Contract, Interface, TransactionReceipt, Wallet, ethers } from "ethers";
+import process from "node:process";
 import "dotenv/config";
 
-// --- CONFIG ---
-const RPC_WSS = process.env.RPC_WSS as string;
-const PRIVATE_KEY = process.env.PRIVATE_KEY as string;
-const TARGET_CONTRACT = process.env.TARGET_CONTRACT as string;
-const MINT_ABI = process.env.MINT_ABI ? JSON.parse(process.env.MINT_ABI) : ["function mint() payable"];
-const MINT_ARGS = process.env.MINT_ARGS ? JSON.parse(process.env.MINT_ARGS) : [];
-const MINT_VALUE = BigInt(process.env.MINT_VALUE || "0");
-const GAS_LIMIT = BigInt(process.env.GAS_LIMIT || "500000");
-const MAX_PRIORITY_FEE_GWEI = BigInt(process.env.MAX_PRIORITY_FEE_GWEI || "50");
-const FEE_BUMP_FACTOR = parseFloat(process.env.FEE_BUMP_FACTOR || "1.5");
-const DRY_RUN = !!parseInt(process.env.DRY_RUN || "1");
+type HexString = `0x${string}`;
 
-// --- GLOBALS ---
-let provider: ethers.WebSocketProvider;
-let wallet: Wallet | undefined;
-let contract: Contract;
-const MINT_SELECTOR = new Interface(MINT_ABI).getFunction("mint")?.selector;
+interface AppConfig {
+  rpcWss: string;
+  privateKey: string;
+  targetContract: HexString;
+  mintAbi: string[];
+  mintArgs: unknown[];
+  mintValue: bigint;
+  gasLimit: bigint;
+  maxPriorityFeeGwei: bigint;
+  feeBumpFactor: number;
+  dryRun: boolean;
+}
+
+const DEFAULT_ABI = ["function mint() payable"];
+
+const config: AppConfig = buildConfig();
 
 class NonceManager {
   private locked = false;
   private nonce = -1;
-  private provider: ethers.WebSocketProvider;
 
-  constructor(provider: ethers.WebSocketProvider) {
-    this.provider = provider;
-  }
+  constructor(private readonly provider: ethers.WebSocketProvider) {}
 
   async init(address: string) {
     this.nonce = await this.provider.getTransactionCount(address, "latest");
   }
 
-  async getNonce() {
+  async next(): Promise<number> {
     while (this.locked) {
       await new Promise(resolve => setTimeout(resolve, 10));
     }
@@ -44,168 +43,195 @@ class NonceManager {
     this.locked = false;
   }
 
-  async syncIfBehind(address: string) {
-    const onChainNonce = await this.provider.getTransactionCount(address, "latest");
-    if (onChainNonce > this.nonce) {
-      console.log(`Nonce out of sync. Local: ${this.nonce}, On-chain: ${onChainNonce}. Syncing...`);
-      this.nonce = onChainNonce;
+  async sync(address: string) {
+    const chainNonce = await this.provider.getTransactionCount(address, "latest");
+    if (chainNonce > this.nonce) {
+      console.warn(`Nonce drift detected. Local ${this.nonce}, chain ${chainNonce}. Syncing.`);
+      this.nonce = chainNonce;
     }
   }
 }
 
-let nonceManager: NonceManager;
+class MintSniper {
+  private provider!: ethers.WebSocketProvider;
+  private wallet?: Wallet;
+  private contract!: Contract;
+  private nonceManager?: NonceManager;
+  private mintSelector?: string;
 
-(async function main() {
-  // --- VALIDATION ---
-  if (!RPC_WSS || !PRIVATE_KEY || !TARGET_CONTRACT) {
-    console.error("Missing required environment variables. Check your .env file.");
-    process.exit(1);
+  constructor(private readonly cfg: AppConfig) {}
+
+  async start() {
+    await this.bootstrap();
+    this.registerEventHandlers();
+    console.log(`Sniper ready. Target ${this.cfg.targetContract}`);
   }
 
-  if (process.env.PRIVATE_KEY === "0xYOUR_BURNER_PRIVATE_KEY") {
-    console.error("Please replace YOUR_BURNER_PRIVATE_KEY in your .env file with a valid private key.");
-    process.exit(1);
-  }
-
-  console.log("--- CONFIGURATION ---");
-  console.log("RPC_WSS:", RPC_WSS);
-  console.log("TARGET_CONTRACT:", TARGET_CONTRACT);
-  console.log("DRY_RUN:", DRY_RUN);
-  console.log("---------------------");
-
-  provider = new ethers.WebSocketProvider(RPC_WSS);
-  try {
-    console.log("Connecting to provider...");
-    await provider.ready;
-    console.log("Provider connected.");
-  } catch (e) {
-    console.error("Could not connect to provider.", e);
-    provider.destroy();
-    process.exit(1);
-  }
-
-  nonceManager = new NonceManager(provider);
-  wallet = DRY_RUN ? undefined : new ethers.Wallet(PRIVATE_KEY, provider);
-  contract = new Contract(TARGET_CONTRACT, MINT_ABI, wallet || provider);
-
-  // --- FUNCTIONS ---
-
-  async function getPriorityFee(): Promise<bigint> {
-    const feeData = await provider.getFeeData();
-    const priorityFee = feeData.maxPriorityFeePerGas;
-    if (!priorityFee) {
-      throw new Error("Could not get priority fee");
+  private async bootstrap() {
+    this.provider = new ethers.WebSocketProvider(this.cfg.rpcWss);
+    try {
+      console.log("Connecting to provider...");
+      await this.provider.ready;
+      console.log("Provider connected.");
+    } catch (err) {
+      console.error("Provider connection failed.", err);
+      this.provider.destroy();
+      process.exit(1);
     }
-    const maxPriorityGwei = ethers.parseUnits(MAX_PRIORITY_FEE_GWEI.toString(), "gwei");
-    return priorityFee > maxPriorityGwei ? maxPriorityGwei : priorityFee;
+
+    this.wallet = this.cfg.dryRun ? undefined : new Wallet(this.cfg.privateKey, this.provider);
+    this.contract = new Contract(this.cfg.targetContract, this.cfg.mintAbi, this.wallet ?? this.provider);
+    this.mintSelector = new Interface(this.cfg.mintAbi).getFunction("mint")?.selector;
+    this.nonceManager = new NonceManager(this.provider);
+
+    if (this.wallet) {
+      await this.nonceManager.init(await this.wallet.getAddress());
+    } else {
+      console.log("Running in DRY_RUN mode. Transactions will not be broadcast.");
+    }
   }
 
-  async function buildAndSendMint(priorityFee: bigint): Promise<TransactionReceipt | undefined> {
-    if (!wallet) {
-      throw new Error("Wallet not initialized");
-    }
-    const addr = await wallet.getAddress();
-    const nonce = await nonceManager.getNonce();
+  private registerEventHandlers() {
+    this.provider.on("pending", (txHash: string) => this.handlePending(txHash).catch(() => undefined));
+    console.log("Listening to pending txs (if supported).");
+    this.provider.on("block", (blockNumber: number) => this.handleBlock(blockNumber).catch(err => console.error("Block handler error", err)));
+  }
 
-    const tx = await contract.mint.populateTransaction(...MINT_ARGS, {
-      value: MINT_VALUE,
-      gasLimit: GAS_LIMIT,
+  private async handlePending(txHash: string) {
+    if (!this.mintSelector) return;
+    const tx = await this.provider.getTransaction(txHash).catch(() => undefined);
+    if (!tx || !tx.to || tx.to.toLowerCase() !== this.cfg.targetContract.toLowerCase()) return;
+    if (tx.data?.startsWith(this.mintSelector)) {
+      console.log("Detected pending mint call:", txHash, "from", tx.from);
+      await this.attemptMint();
+    }
+  }
+
+  private async handleBlock(blockNumber: number) {
+    if (!this.mintSelector) return;
+    const block = await this.provider.getBlock(blockNumber);
+    if (!block) return;
+    for (const txHash of block.transactions) {
+      const tx = await this.provider.getTransaction(txHash);
+      if (!tx || !tx.to || tx.to.toLowerCase() !== this.cfg.targetContract.toLowerCase()) continue;
+      if (tx.data?.startsWith(this.mintSelector)) {
+        console.log("Detected mint call in block:", tx.hash);
+        await this.attemptMint();
+      }
+    }
+  }
+
+  private async attemptMint() {
+    const basePriority = await this.getPriorityFee();
+    try {
+      await this.buildAndSendMint(basePriority);
+      return;
+    } catch (err) {
+      console.warn("Initial send failed:", (err as Error).message);
+    }
+
+    const bumped = this.bumpPriority(basePriority);
+    try {
+      console.log("Retrying with bumped priority:", ethers.formatUnits(bumped, "gwei"), "gwei");
+      await this.buildAndSendMint(bumped);
+    } catch (err) {
+      console.error("Retry failed:", (err as Error).message);
+    }
+  }
+
+  private bumpPriority(base: bigint) {
+    const baseGwei = Number(ethers.formatUnits(base, "gwei"));
+    const bumpedGwei = Math.ceil(baseGwei * this.cfg.feeBumpFactor);
+    return ethers.parseUnits(String(bumpedGwei), "gwei");
+  }
+
+  private async getPriorityFee(): Promise<bigint> {
+    const feeData = await this.provider.getFeeData();
+    const priority = feeData.maxPriorityFeePerGas;
+    if (!priority) throw new Error("Could not fetch priority fee.");
+
+    const maxPriority = ethers.parseUnits(this.cfg.maxPriorityFeeGwei.toString(), "gwei");
+    return priority > maxPriority ? maxPriority : priority;
+  }
+
+  private async buildAndSendMint(priorityFee: bigint): Promise<TransactionReceipt | undefined> {
+    if (!this.contract || !this.mintSelector) throw new Error("Contract not initialized.");
+    const nonceMgr = this.nonceManager;
+    const signer = this.wallet;
+
+    if (!nonceMgr) throw new Error("Nonce manager unavailable.");
+    const nonce = await nonceMgr.next();
+
+    const txRequest = await this.contract.mint.populateTransaction(...this.cfg.mintArgs, {
+      value: this.cfg.mintValue,
+      gasLimit: this.cfg.gasLimit,
       maxPriorityFeePerGas: priorityFee,
-      nonce: nonce,
+      nonce,
     });
 
-    if (DRY_RUN) {
-      console.log("DRY RUN: tx built:", {
-        to: tx.to,
-        data: tx.data,
-        value: tx.value?.toString(),
-        gasLimit: tx.gasLimit?.toString(),
+    if (this.cfg.dryRun || !signer) {
+      console.log("DRY RUN tx:", {
+        to: txRequest.to,
         priorityGwei: Number(ethers.formatUnits(priorityFee, "gwei")),
+        data: txRequest.data,
       });
-      nonceManager.release();
-      return;
+      nonceMgr.release();
+      return undefined;
     }
 
     try {
-      const sent = await wallet.sendTransaction(tx);
-      console.log("Tx sent:", sent.hash, "nonce:", nonce.toString(), "priority(gwei):", Number(ethers.formatUnits(priorityFee, "gwei")));
-
-      const receipt = await sent.wait(1);
-      if (receipt) {
-        console.log("Receipt status:", receipt.status ?? "unknown", "tx:", sent.hash);
-      } else {
-        console.log("Receipt is null for tx:", sent.hash);
-      }
-
-      await nonceManager.syncIfBehind(addr);
-      nonceManager.release();
+      const sentTx = await signer.sendTransaction(txRequest);
+      console.log("Tx sent:", sentTx.hash, "nonce:", nonce);
+      const receipt = await sentTx.wait(1);
+      console.log("Receipt status:", receipt?.status ?? "unknown", "hash:", sentTx.hash);
+      await nonceMgr.sync(await signer.getAddress());
       return receipt ?? undefined;
-    } catch (err: any) {
-      nonceManager.release();
-      throw err;
+    } finally {
+      nonceMgr.release();
     }
   }
+}
 
-  async function attemptMintWithBump() {
-    const base = await getPriorityFee();
-    try {
-      await buildAndSendMint(base);
-    } catch (e) {
-      const baseGwei = Number(ethers.formatUnits(base, "gwei"));
-      const bumpedGwei = Math.ceil(baseGwei * FEE_BUMP_FACTOR);
-      const bumped = ethers.parseUnits(String(bumpedGwei), "gwei");
-      console.log("Initial send failed; retrying with bumped priority:", bumpedGwei, "gwei");
-      try {
-        await buildAndSendMint(bumped);
-      } catch (err: any) {
-        console.error("Retry also failed:", err?.message ?? err);
-      }
+function buildConfig(): AppConfig {
+  const required = ["RPC_WSS", "PRIVATE_KEY", "TARGET_CONTRACT"] as const;
+  required.forEach(key => {
+    if (!process.env[key]) {
+      console.error(`Missing required env ${key}. Check your .env file.`);
+      process.exit(1);
     }
+  });
+
+  if (process.env.PRIVATE_KEY === "0xYOUR_BURNER_PRIVATE_KEY") {
+    console.error("Replace YOUR_BURNER_PRIVATE_KEY with a valid key.");
+    process.exit(1);
   }
 
-  async function handlePending(txHash: string) {
-    try {
-      const tx = await provider.getTransaction(txHash);
-      if (!tx || !tx.to) return;
-      if (tx.to.toLowerCase() !== TARGET_CONTRACT.toLowerCase()) return;
-      if (!tx.data || !MINT_SELECTOR) return;
-      if (tx.data.startsWith(MINT_SELECTOR)) {
-        console.log("Detected pending mint call:", txHash, "from", tx.from);
-        await attemptMintWithBump();
-      }
-    } catch {
-      // ignore transient errors
-    }
+  return {
+    rpcWss: process.env.RPC_WSS!,
+    privateKey: process.env.PRIVATE_KEY!,
+    targetContract: process.env.TARGET_CONTRACT! as HexString,
+    mintAbi: parseJson<string[]>("MINT_ABI", DEFAULT_ABI),
+    mintArgs: parseJson<unknown[]>("MINT_ARGS", []),
+    mintValue: BigInt(process.env.MINT_VALUE ?? "0"),
+    gasLimit: BigInt(process.env.GAS_LIMIT ?? "500000"),
+    maxPriorityFeeGwei: BigInt(process.env.MAX_PRIORITY_FEE_GWEI ?? "50"),
+    feeBumpFactor: Number(process.env.FEE_BUMP_FACTOR ?? "1.5"),
+    dryRun: Boolean(Number(process.env.DRY_RUN ?? "1")),
+  };
+}
+
+function parseJson<T>(envKey: string, fallback: T): T {
+  const raw = process.env[envKey];
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    console.warn(`Failed to parse ${envKey}. Using fallback.`);
+    return fallback;
   }
+}
 
-  async function handleBlock(blockNumber: number) {
-    try {
-      const block = await provider.getBlock(blockNumber);
-      if (!block) return;
-      for (const txHash of block.transactions) {
-          const tx = await provider.getTransaction(txHash);
-          if (!tx || !tx.to) continue;
-          if (tx.to.toLowerCase() !== TARGET_CONTRACT.toLowerCase()) continue;
-          if (tx.data && MINT_SELECTOR && tx.data.startsWith(MINT_SELECTOR)) {
-              console.log("Detected mint call in block tx:", tx.hash);
-              await attemptMintWithBump();
-          }
-      }
-    } catch (err) {
-      console.error("Block handler error:", err);
-    }
-  }
-
-  if (wallet) {
-    await nonceManager.init(await wallet.getAddress());
-  } else {
-    console.log("No wallet loaded — running in DRY_RUN mode (signing/broadcast disabled).");
-  }
-
-  provider.on("pending", handlePending);
-  console.log("Listening to pending txs (if provider supports it).");
-
-  provider.on("block", handleBlock);
-
-  console.log("Sniper started. Target:", TARGET_CONTRACT);
+(async () => {
+  const sniper = new MintSniper(config);
+  await sniper.start();
 })();

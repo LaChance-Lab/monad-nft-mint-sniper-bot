@@ -32,7 +32,7 @@ Set the following environment variables before running the bot:
 ## Getting Started
 
 ```bash
-git clone https://github.com/<your-org>/monad-nft-mint-sniper-bot.git
+git clone https://github.com/Lachance-Lab/monad-nft-mint-sniper-bot.git
 cd monad-nft-mint-sniper-bot
 pnpm install        # or npm install
 cp .env.example .env
