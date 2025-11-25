@@ -13,7 +13,12 @@ optimized mint transactions faster than manual workflows.
 - Built-in dry-run simulator to verify strategy logic before funding
 
 ## Contact
-https://t.me/lachancelab
+
+| Channel | Details |
+|---------|---------|
+| Telegram | [@lachancelab](https://t.me/lachancelab) |
+
+Reach out for support, bespoke strategy tuning, or partnership requests.
 
 ## Requirements
 
